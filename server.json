@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/defillama",
+  "title": "defillama",
+  "description": "DefiLlama MCP — DeFi analytics from DefiLlama (free, no auth)",
+  "version": "0.1.0",
+  "websiteUrl": "https://pipeworx.io/packs/defillama",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-defillama",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/defillama/mcp"
+    }
+  ]
+}
