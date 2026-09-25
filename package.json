@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-defillama",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DefiLlama MCP — DeFi analytics from DefiLlama (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-04476f10e7115521ebe9efb1731acef10de8631b74c9c61dca63449023364ef2",
-    "sourceCommit": "839ab210d969ef7f822cd747ea516f6bb49e9231"
+    "sourceHash": "v1-4e54e774e4f1d51bfa6b8b568aee27063d3d2864fc14cdb25a0f6f201ea0c8a9",
+    "sourceCommit": "56d3c46c09bb3078ffdbdbca992a93f406bcd382"
   }
 }

@@ -2,7 +2,7 @@
 
 DefiLlama is the canonical free dashboard and API for decentralized finance. TVL (total value locked), protocol tokens, yield aggregators, stablecoins, derivatives, lending markets, DEX volumes — across every major chain and protocol. Used by everyone in crypto. Free, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 ## Why this matters for AI agents
 
@@ -86,7 +86,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
