@@ -680,6 +680,12 @@ function collapse(s: string): string {
  * - defi_protocol_fees: fee/revenue data for a protocol
  * - defi_stablecoins: stablecoin market data
  * - defi_yields: DeFi yield pool opportunities
+ * - defi_token_unlocks: token unlocks across all tracked tokens in a date window
+ * - defi_token_emission: one token's full vesting / emission schedule
+ *
+ * Unlock data comes from DefiLlama's public datasets host (the same files
+ * defillama.com/unlocks renders), because api.llama.fi/emissions answers 402
+ * "Upgrade to the paid API plan" (verified from a Worker 2026-10-09, fleet #2844).
  */
 
 
@@ -694,6 +700,8 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 const BASE = 'https://api.llama.fi';
 const STABLECOINS = 'https://stablecoins.llama.fi';
 const YIELDS = 'https://yields.llama.fi';
+const DATASETS = 'https://defillama-datasets.llama.fi';
+const COINS = 'https://coins.llama.fi';
 
 const tools: McpToolExport['tools'] = [
   {
@@ -791,6 +799,51 @@ const tools: McpToolExport['tools'] = [
       },
     },
   },
+  {
+    name: 'defi_token_unlocks',
+    description:
+      'Crypto token UNLOCK calendar from DefiLlama: every scheduled vesting cliff and emission-rate change across ~370 tracked tokens in a date window (e.g. "which token unlocks are scheduled this week", "unlocks over $10M between 2026-10-05 and 2026-10-12"). Returns per event: date, token, tokens unlocked, USD value at the current DefiLlama price (with the price time), share of circulating supply, and the recipients (investors, team, ecosystem…). Default window is today through 7 days out.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        from: {
+          type: 'string',
+          description: 'Window start, YYYY-MM-DD (UTC, inclusive). Default: today.',
+        },
+        to: {
+          type: 'string',
+          description: 'Window end, YYYY-MM-DD (UTC, inclusive). Default: from + 7 days.',
+        },
+        min_usd: {
+          type: 'number',
+          description: 'Only cliff unlocks worth at least this many USD at the current price (e.g. 1000000). Excludes emission-rate changes, which have no single USD amount.',
+        },
+        token: {
+          type: 'string',
+          description: 'Restrict to tokens whose name, symbol or DefiLlama slug contains this text (e.g. "hyperliquid", "ARB").',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max events returned, sorted by date then USD value (default 100, max 500).',
+        },
+      },
+    },
+  },
+  {
+    name: 'defi_token_emission',
+    description:
+      'One crypto token\'s full vesting / EMISSION SCHEDULE from DefiLlama (e.g. "Hyperliquid HYPE unlock schedule", "when do Arbitrum team tokens vest"). Returns max supply, allocation by category (insiders, airdrop, staking…) with % unlocked so far, per-recipient unlocked-now vs final amounts, the dated unlock events (past and upcoming, with USD value at the current price), and DefiLlama\'s methodology notes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        protocol: {
+          type: 'string',
+          description: 'DefiLlama protocol slug or name (e.g. "hyperliquid", "arbitrum", "aptos", "sui"). Unknown names return close matches.',
+        },
+      },
+      required: ['protocol'],
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -811,6 +864,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.min_tvl as number | undefined,
         args.min_apy as number | undefined,
       );
+    case 'defi_token_unlocks':
+      return getTokenUnlocks(args);
+    case 'defi_token_emission':
+      return getTokenEmission(String(args.protocol ?? ''));
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1079,6 +1136,370 @@ async function getYields(search?: string, minTvl?: number, minApy?: number) {
       il_risk: p.ilRisk ?? null,
       exposure: p.exposure ?? null,
     })),
+  };
+}
+
+/* ── Token unlocks / emissions ──────────────────────────────────────── */
+
+interface CliffAllocation {
+  recipient?: string;
+  category?: string;
+  amount?: number;
+}
+
+interface LinearAllocation {
+  recipient?: string;
+  category?: string;
+  unlockType?: string;
+  previousRatePerWeek?: number;
+  newRatePerWeek?: number;
+  endTimestamp?: number;
+}
+
+interface UnlockEvent {
+  timestamp: number;
+  cliffAllocations?: CliffAllocation[];
+  linearAllocations?: LinearAllocation[];
+}
+
+interface TokenPrice {
+  price?: number;
+  symbol?: string;
+  timestamp?: number;
+}
+
+interface EmissionsIndexRow {
+  token?: string;
+  name?: string;
+  protocolSlug?: string;
+  gecko_id?: string;
+  circSupply?: number;
+  maxSupply?: number;
+  mcap?: number;
+  tokenPrice?: TokenPrice[];
+  unlockEvents?: UnlockEvent[];
+}
+
+const DAY_SEC = 86_400;
+
+function isoDate(sec: number): string {
+  return new Date(sec * 1000).toISOString().slice(0, 10);
+}
+
+function isoTime(sec: number | undefined): string | null {
+  return typeof sec === 'number' && Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null;
+}
+
+function lastModifiedIso(res: Response): string | null {
+  const lm = res.headers.get('last-modified');
+  if (!lm) return null;
+  const t = Date.parse(lm);
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+function parseDay(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const s = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new Error(`${field} must be YYYY-MM-DD, got "${s}"`);
+  const t = Date.parse(`${s}T00:00:00Z`);
+  if (!Number.isFinite(t)) throw new Error(`${field} is not a real date: "${s}"`);
+  return t / 1000;
+}
+
+function round(n: number, digits = 2): number {
+  const f = 10 ** digits;
+  return Math.round(n * f) / f;
+}
+
+function mapEvent(e: UnlockEvent, price: number | null, circSupply: number | null) {
+  const cliffs = (e.cliffAllocations ?? []).filter((c) => typeof c.amount === 'number' && c.amount > 0);
+  const cliffTokens = cliffs.reduce((sum, c) => sum + (c.amount as number), 0);
+  const linear = (e.linearAllocations ?? []).map((l) => ({
+    recipient: l.recipient ?? null,
+    category: l.category ?? null,
+    change: l.unlockType ?? null,
+    previous_tokens_per_week: l.previousRatePerWeek ?? null,
+    new_tokens_per_week: l.newRatePerWeek ?? null,
+    ends: typeof l.endTimestamp === 'number' ? isoDate(l.endTimestamp) : null,
+  }));
+  return {
+    date: isoDate(e.timestamp),
+    timestamp: isoTime(e.timestamp),
+    cliff_tokens: cliffTokens > 0 ? round(cliffTokens, 4) : 0,
+    cliff_usd: cliffTokens > 0 && price !== null ? Math.round(cliffTokens * price) : null,
+    pct_of_circulating_supply:
+      cliffTokens > 0 && circSupply ? round((cliffTokens / circSupply) * 100, 3) : null,
+    recipients: cliffs.map((c) => ({
+      recipient: c.recipient ?? null,
+      category: c.category ?? null,
+      tokens: round(c.amount as number, 4),
+    })),
+    emission_rate_changes: linear,
+  };
+}
+
+/**
+ * Stream the ~22 MB emissionsIndex and hand each element of its top-level
+ * `data` array to `onRow` one at a time. Parsing the whole file at once costs
+ * ~55 MB of heap at peak (string + object graph, measured in node), which is
+ * too close to the isolate limit inside the gateway; this keeps peak memory
+ * at one token's record.
+ */
+async function streamIndexRows(body: ReadableStream<Uint8Array>, onRow: (row: EmissionsIndexRow) => void): Promise<number> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let start = -1;
+  let rows = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    const chunk = done ? decoder.decode() : decoder.decode(value, { stream: true });
+    const offset = buf.length;
+    buf += chunk;
+    for (let i = offset; i < buf.length; i++) {
+      const ch = buf[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{' || ch === '[') {
+        // depth 1 = the wrapper object, 2 = the data array, 3 = one row
+        if (depth === 2 && ch === '{') start = i;
+        depth++;
+      } else if (ch === '}' || ch === ']') {
+        depth--;
+        if (depth === 2 && ch === '}' && start >= 0) {
+          onRow(JSON.parse(buf.slice(start, i + 1)) as EmissionsIndexRow);
+          rows++;
+          start = -1;
+        }
+      }
+    }
+    // Keep only the unfinished row (if any); everything before it is consumed.
+    if (start >= 0) {
+      buf = buf.slice(start);
+      start = 0;
+    } else {
+      buf = '';
+    }
+    if (done) break;
+  }
+  if (depth !== 0) throw new Error(`DefiLlama emissionsIndex ended mid-document (depth ${depth}) — truncated response`);
+  return rows;
+}
+
+async function getTokenUnlocks(args: Record<string, unknown>) {
+  const todaySec = Math.floor(Date.now() / 1000 / DAY_SEC) * DAY_SEC;
+  const fromSec = parseDay(args.from, 'from') ?? todaySec;
+  const toDaySec = parseDay(args.to, 'to') ?? fromSec + 7 * DAY_SEC;
+  if (toDaySec < fromSec) throw new Error(`to (${isoDate(toDaySec)}) is before from (${isoDate(fromSec)})`);
+  const toExclusive = toDaySec + DAY_SEC;
+  const minUsd = typeof args.min_usd === 'number' ? args.min_usd : args.min_usd ? Number(args.min_usd) : undefined;
+  const tokenQ = typeof args.token === 'string' && args.token.trim() ? args.token.trim().toLowerCase() : null;
+  const limit = Math.min(Math.max(Number(args.limit) || 100, 1), 500);
+
+  const res = await pwFetch(`${DATASETS}/emissionsIndex`);
+  if (!res.ok) throw await httpError(res, 'DefiLlama emissionsIndex error');
+  if (!res.body) throw new Error('DefiLlama emissionsIndex returned an empty body');
+
+  const events: Record<string, unknown>[] = [];
+  let tokensScanned = 0;
+  const rowCount = await streamIndexRows(res.body, (row) => {
+    tokensScanned++;
+    const tp = row.tokenPrice?.[0];
+    const symbol = tp?.symbol ?? null;
+    if (tokenQ) {
+      const hay = [row.name, row.protocolSlug, symbol, row.gecko_id].filter(Boolean).join(' ').toLowerCase();
+      if (!hay.includes(tokenQ)) return;
+    }
+    const price = typeof tp?.price === 'number' ? tp.price : null;
+    for (const e of row.unlockEvents ?? []) {
+      if (typeof e.timestamp !== 'number' || e.timestamp < fromSec || e.timestamp >= toExclusive) continue;
+      const mapped = mapEvent(e, price, row.circSupply ?? null);
+      if (mapped.cliff_tokens === 0 && mapped.emission_rate_changes.length === 0) continue;
+      if (minUsd !== undefined && (mapped.cliff_usd ?? 0) < minUsd) continue;
+      events.push({
+        token: row.name ?? null,
+        symbol,
+        slug: row.protocolSlug ?? null,
+        token_id: row.token ?? null,
+        ...mapped,
+        price_usd: price,
+        price_as_of: isoTime(tp?.timestamp),
+        market_cap_usd: typeof row.mcap === 'number' ? Math.round(row.mcap) : null,
+      });
+    }
+  });
+  if (rowCount === 0) throw new Error('DefiLlama emissionsIndex parsed to zero tokens — upstream format changed');
+
+  events.sort((a, b) =>
+    String(a.timestamp).localeCompare(String(b.timestamp)) ||
+    ((b.cliff_usd as number | null) ?? 0) - ((a.cliff_usd as number | null) ?? 0),
+  );
+  const shown = events.slice(0, limit);
+  const totalUsd = events.reduce((s, e) => s + ((e.cliff_usd as number | null) ?? 0), 0);
+
+  return {
+    found: events.length > 0,
+    window: { from: isoDate(fromSec), to: isoDate(toDaySec) },
+    filters: { min_usd: minUsd ?? null, token: tokenQ },
+    tokens_scanned: tokensScanned,
+    total_events: events.length,
+    showing: shown.length,
+    total_cliff_usd: Math.round(totalUsd),
+    events: shown,
+    ...(events.length === 0
+      ? { note: `No scheduled unlocks in ${isoDate(fromSec)}..${isoDate(toDaySec)} among the ${tokensScanned} tokens DefiLlama tracks${tokenQ || minUsd !== undefined ? ' that match the filters' : ''}.` }
+      : {}),
+    usd_basis: 'cliff_usd = tokens unlocked x the current DefiLlama price (price_as_of), not the price on the unlock date.',
+    data_as_of: lastModifiedIso(res),
+    source: 'DefiLlama unlocks dataset (defillama-datasets.llama.fi/emissionsIndex), https://defillama.com/unlocks',
+  };
+}
+
+function normalizeSlug(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, '-');
+}
+
+async function getTokenEmission(protocol: string) {
+  if (!protocol.trim()) throw new Error('protocol is required (e.g. "hyperliquid")');
+  const slug = normalizeSlug(protocol);
+  let res = await pwFetch(`${DATASETS}/emissions/${encodeURIComponent(slug)}`);
+  let resolvedSlug = slug;
+
+  if (res.status === 404) {
+    const listRes = await pwFetch(`${DATASETS}/emissionsProtocolsList`);
+    if (!listRes.ok) throw await httpError(listRes, 'DefiLlama emissionsProtocolsList error');
+    const list = (await listRes.json()) as string[];
+    const bare = slug.replace(/[^a-z0-9]/g, '');
+    const matches = list.filter((p) => {
+      const pb = p.replace(/[^a-z0-9]/g, '');
+      return pb === bare || pb.includes(bare) || (bare.length >= 4 && bare.includes(pb));
+    });
+    if (matches.length === 1) {
+      resolvedSlug = matches[0];
+      res = await pwFetch(`${DATASETS}/emissions/${encodeURIComponent(resolvedSlug)}`);
+    } else {
+      return {
+        found: false,
+        protocol,
+        message: `DefiLlama has no emission schedule under "${slug}".`,
+        suggestions: matches.slice(0, 20),
+        tracked_protocols: list.length,
+        data_as_of: lastModifiedIso(listRes),
+        source: 'DefiLlama unlocks dataset (defillama-datasets.llama.fi/emissionsProtocolsList)',
+      };
+    }
+  }
+  if (!res.ok) throw await httpError(res, 'DefiLlama emission error');
+
+  const data = (await res.json()) as {
+    name?: string;
+    gecko_id?: string;
+    chainName?: string;
+    protocolCategory?: string;
+    supplyMetrics?: Record<string, number>;
+    categories?: Record<string, string[]>;
+    documentedData?: {
+      data?: { label: string; data: { timestamp: number; unlocked: number }[] }[];
+      tokenAllocation?: {
+        current?: Record<string, number>;
+        final?: Record<string, number>;
+        progress?: Record<string, number>;
+      };
+    };
+    metadata?: {
+      token?: string;
+      total?: number;
+      notes?: string[];
+      sources?: string[];
+      unlockEvents?: UnlockEvent[];
+    };
+  };
+
+  // Current price is best-effort: the schedule is the answer, the USD figure is a convenience.
+  let price: number | null = null;
+  let priceAsOf: string | null = null;
+  let symbol: string | null = null;
+  let priceNote: string | undefined;
+  const coinId = data.metadata?.token ?? (data.gecko_id ? `coingecko:${data.gecko_id}` : null);
+  if (coinId) {
+    const pr = await pwFetch(`${COINS}/prices/current/${encodeURIComponent(coinId)}`);
+    if (pr.ok) {
+      const pj = (await pr.json()) as { coins?: Record<string, TokenPrice> };
+      const c = pj.coins?.[coinId];
+      if (c && typeof c.price === 'number') {
+        price = c.price;
+        priceAsOf = isoTime(c.timestamp);
+        symbol = c.symbol ?? null;
+      } else {
+        priceNote = `coins.llama.fi has no current price for ${coinId}`;
+      }
+    } else {
+      priceNote = `coins.llama.fi price lookup failed with HTTP ${pr.status}`;
+    }
+  }
+
+  const nowSec = Date.now() / 1000;
+  const circ = data.supplyMetrics?.adjustedSupply ?? null;
+  const allEvents = (data.metadata?.unlockEvents ?? [])
+    .filter((e) => typeof e.timestamp === 'number')
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((e) => ({ ...mapEvent(e, price, circ), upcoming: e.timestamp >= nowSec }));
+  const upcoming = allEvents.filter((e) => e.upcoming);
+  const past = allEvents.filter((e) => !e.upcoming);
+
+  const sections = (data.documentedData?.data ?? []).map((sec) => {
+    const pts = sec.data ?? [];
+    let now: number | null = null;
+    for (const p of pts) if (p.timestamp <= nowSec) now = p.unlocked;
+    const final = pts.length ? pts[pts.length - 1] : null;
+    return {
+      recipient: sec.label,
+      unlocked_now: now,
+      unlocked_at_schedule_end: final?.unlocked ?? null,
+      schedule_end: final ? isoDate(final.timestamp) : null,
+    };
+  });
+
+  return {
+    found: true,
+    protocol: resolvedSlug,
+    name: data.name ?? resolvedSlug,
+    symbol,
+    token_id: data.metadata?.token ?? null,
+    chain: data.chainName ?? null,
+    category: data.protocolCategory ?? null,
+    max_supply: data.metadata?.total ?? data.supplyMetrics?.maxSupply ?? null,
+    supply_metrics: data.supplyMetrics ?? null,
+    price_usd: price,
+    price_as_of: priceAsOf,
+    ...(priceNote ? { price_note: priceNote } : {}),
+    allocation_pct_by_category: data.documentedData?.tokenAllocation?.final ?? null,
+    unlocked_pct_by_category: data.documentedData?.tokenAllocation?.progress ?? null,
+    category_recipients: data.categories ?? null,
+    recipients: sections,
+    ...(upcoming.length === 0
+      ? {
+          upcoming_note: data.supplyMetrics?.tbdAmount
+            ? `DefiLlama documents no future dated unlocks for this token; ${Math.round(data.supplyMetrics.tbdAmount).toLocaleString('en-US')} tokens have no published schedule (supply_metrics.tbdAmount).`
+            : 'DefiLlama documents no future dated unlocks for this token.',
+        }
+      : {}),
+    upcoming_events_total: upcoming.length,
+    upcoming_events: upcoming.slice(0, 50),
+    past_events_total: past.length,
+    recent_past_events: past.slice(-10),
+    notes: data.metadata?.notes ?? [],
+    usd_basis: 'cliff_usd = tokens unlocked x the current DefiLlama price (price_as_of), not the price on the unlock date.',
+    data_as_of: lastModifiedIso(res),
+    source: `DefiLlama unlocks dataset (defillama-datasets.llama.fi/emissions/${resolvedSlug}), https://defillama.com/unlocks/${resolvedSlug}`,
   };
 }
 
