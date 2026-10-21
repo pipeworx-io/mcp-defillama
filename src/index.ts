@@ -670,6 +670,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * DefiLlama MCP — DeFi analytics from DefiLlama (free, no auth)
  *
@@ -769,6 +1017,22 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'defi_revenue_ranking',
+    description:
+      'Rank DeFi protocols by revenue (or fees) over the last 24h, 7d or 30d, with the change versus the prior period. Answers "top DeFi protocols by 30-day revenue" and "which protocols\' revenue grew most". Filter by category (e.g. "Dexs", "Lending", "Liquid Staking") and/or chain. Each row: protocol slug, category, chains, revenue for the period, prior-period revenue, percent change, 24h/7d/30d totals and all-time total (USD). Source: DefiLlama, fees and revenue dataset. Pass a returned slug to defi_protocol_fees for the daily series.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        data_type: { type: 'string', enum: ['dailyRevenue', 'dailyFees'], description: 'Rank by revenue (default) or gross fees.' },
+        period: { type: 'string', enum: ['24h', '7d', '30d'], description: 'Window to rank on. Default "30d".' },
+        sort_by: { type: 'string', enum: ['value', 'change'], description: '"value" (default) ranks by period revenue; "change" ranks by percent change vs the prior period (protocols with under $10k prior-period revenue excluded).' },
+        category: { type: 'string', description: 'Category filter, case-insensitive, e.g. "Lending", "Dexs".' },
+        chain: { type: 'string', description: 'Chain filter, case-insensitive, e.g. "Ethereum", "Solana".' },
+        limit: { type: 'number', description: 'Rows to return, 1-100. Default 20.' },
+      },
+    },
+  },
+  {
     name: 'defi_stablecoins',
     description:
       'Get stablecoin market cap and distribution across blockchains. Returns supply per chain to track adoption and network preferences.',
@@ -856,6 +1120,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return getChainTvl();
     case 'defi_protocol_fees':
       return getProtocolFees(args.protocol as string, (args.data_type as string) ?? 'dailyFees');
+    case 'defi_revenue_ranking':
+      return getRevenueRanking(args);
     case 'defi_stablecoins':
       return getStablecoins();
     case 'defi_yields':
@@ -994,15 +1260,110 @@ async function getChainTvl() {
   };
 }
 
+/** DefiLlama's fees endpoint is keyed by a VERSIONED slug, and the protocols
+ *  whose bare name is a household word are exactly the ones whose bare name is
+ *  not a slug. Measured live 2026-10-21:
+ *
+ *    protocol=curve     -> 400 "Fees for curve not found, please visit /overview/fees"
+ *    protocol=curve-dex -> 200, total_24h 64,734
+ *    protocol=compound  -> 400          compound-v3 / compound-v2 -> 200
+ *
+ *  So the upstream is healthy and this was our bug twice over: we surfaced a
+ *  not-found (served as a 400) as a hard tool error with no recovery, and the
+ *  resolver that fixes it is already in this file -- `defi_tvl_protocols`
+ *  fetches /protocols, and a search for "curve" returns {name:"Curve DEX",
+ *  slug:"curve-dex"} as its top hit by TVL.
+ *
+ *  The match is deliberately TIGHT, not a substring sweep: an exact slug, an
+ *  exact normalized name, or the input as a leading hyphen-delimited segment
+ *  (`curve` -> `curve-dex`, `compound` -> `compound-v3`). A loose `includes`
+ *  would answer a question nobody asked by resolving a genuinely unknown
+ *  protocol onto an unrelated one -- a wrong answer, which is worse than the
+ *  error it replaces. Highest TVL wins among candidates, so `compound` picks
+ *  the live v3 over a deprecated version. */
+export function pickFeesSlug(
+  protocols: { name: string; slug: string; tvl?: number }[],
+  input: string,
+): { slug: string; name: string } | null {
+  const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const q = input.toLowerCase().trim();
+  const qn = norm(q);
+  // An EXACT hit (the slug itself, or the name) always resolves, whatever its TVL --
+  // the caller named this protocol and a zero-TVL protocol can still earn fees.
+  const exact = protocols.filter((p) => {
+    const slug = (p.slug ?? '').toLowerCase();
+    return slug === q || norm(p.name ?? '') === qn;
+  });
+  // A PREFIX hit is an inference, not an identity, so it must clear a floor: live
+  // verification 2026-10-21 found `swap` resolving onto `swap-country` (TVL 0) purely
+  // because the slug begins `swap-`. Answering an obscure protocol under a generic word
+  // is the wrong-answer failure this resolver is supposed to avoid, and a fixture-based
+  // unit test could not see it -- only the live catalog contains that row. Requiring
+  // non-zero TVL excludes it while `curve-dex` (1.2B) and `compound-v3` (2.9B) clear it
+  // by nine orders of magnitude.
+  const prefix = protocols.filter(
+    (p) => (p.slug ?? '').toLowerCase().startsWith(`${q}-`) && (p.tvl ?? 0) > 0,
+  );
+  const candidates = exact.length > 0 ? exact : prefix;
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => (b.tvl ?? 0) - (a.tvl ?? 0));
+  return { slug: candidates[0].slug, name: candidates[0].name };
+}
+
+async function fetchFeesSummary(slug: string, dataType: string) {
+  return pwFetch(
+    `${BASE}/summary/fees/${encodeURIComponent(slug)}?dataType=${encodeURIComponent(dataType)}`,
+  );
+}
+
 async function getProtocolFees(protocol: string, dataType: string) {
   const validTypes = ['dailyFees', 'dailyRevenue'];
   if (!validTypes.includes(dataType)) {
     throw new Error(`Invalid data_type: "${dataType}". Must be one of: ${validTypes.join(', ')}`);
   }
 
-  const res = await pwFetch(
-    `${BASE}/summary/fees/${encodeURIComponent(protocol)}?dataType=${encodeURIComponent(dataType)}`,
-  );
+  let res = await fetchFeesSummary(protocol, dataType);
+  let resolvedSlug: string | null = null;
+
+  // A not-found served as a 400. Resolve the versioned slug and retry once
+  // rather than handing the caller an error we can answer ourselves.
+  if (res.status === 400) {
+    const body = await res.clone().text();
+    if (/Fees for .* not found/i.test(body)) {
+      const listRes = await pwFetch(`${BASE}/protocols`);
+      if (listRes.ok) {
+        const all = (await listRes.json()) as { name: string; slug: string; tvl?: number }[];
+        const hit = pickFeesSlug(all, protocol);
+        if (hit && hit.slug.toLowerCase() !== protocol.toLowerCase()) {
+          const retry = await fetchFeesSummary(hit.slug, dataType);
+          if (retry.ok) {
+            res = retry;
+            resolvedSlug = hit.slug;
+          }
+        }
+        if (!resolvedSlug) {
+          // Genuinely no fees record. Say so as a found:false rather than throwing:
+          // "has no fees data" and "is not a real protocol" must not be the same answer.
+          const near = all
+            .filter((p) => (p.slug ?? '').toLowerCase().includes(protocol.toLowerCase()))
+            .sort((a, b) => (b.tvl ?? 0) - (a.tvl ?? 0))
+            .slice(0, 8)
+            .map((p) => p.slug);
+          return {
+            protocol,
+            data_type: dataType,
+            found: false,
+            empty_reason: 'no_fees_data',
+            hint: near.length
+              ? `DefiLlama has no fees record under "${protocol}". It keys fees by a versioned slug — try one of these.`
+              : `DefiLlama has no fees record under "${protocol}", and no protocol slug contains that name. This may not be a tracked protocol; defi_tvl_protocols({search:"${protocol}"}) lists what is.`,
+            candidates: near,
+          };
+        }
+      }
+    }
+  }
+
   if (!res.ok) throw await httpError(res, 'DefiLlama API error');
 
   const data = (await res.json()) as {
@@ -1024,6 +1385,7 @@ async function getProtocolFees(protocol: string, dataType: string) {
 
   return {
     protocol,
+    ...(resolvedSlug ? { resolved_slug: resolvedSlug, requested_protocol: protocol } : {}),
     data_type: dataType,
     name: data.name ?? protocol,
     total_24h: data.total24h ?? null,
@@ -1032,6 +1394,83 @@ async function getProtocolFees(protocol: string, dataType: string) {
     total_30d: data.total30d ?? null,
     total_all_time: data.totalAllTime ?? null,
     daily_chart_last_30: dailyData,
+  };
+}
+
+async function getRevenueRanking(args: Record<string, unknown>) {
+  const dataType = String(args.data_type ?? 'dailyRevenue');
+  if (dataType !== 'dailyRevenue' && dataType !== 'dailyFees') {
+    throw new Error(`Invalid data_type: "${dataType}". Must be dailyRevenue or dailyFees`);
+  }
+  const period = String(args.period ?? '30d');
+  if (!['24h', '7d', '30d'].includes(period)) throw new Error(`Invalid period: "${period}". Must be 24h, 7d or 30d`);
+  const sortBy = String(args.sort_by ?? 'value');
+  if (sortBy !== 'value' && sortBy !== 'change') throw new Error(`Invalid sort_by: "${sortBy}". Must be value or change`);
+  const limitN = Math.min(100, Math.max(1, Math.floor(Number(args.limit)) || 20));
+  const category = args.category ? String(args.category).toLowerCase() : null;
+  const chain = args.chain ? String(args.chain).toLowerCase() : null;
+
+  const res = await pwFetch(
+    `${BASE}/overview/fees?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=${dataType}`,
+  );
+  if (!res.ok) throw await httpError(res, 'DefiLlama API error');
+  type Row = {
+    name?: string; displayName?: string; slug?: string; category?: string; chains?: string[];
+    total24h?: number | null; total48hto24h?: number | null; total7d?: number | null; total14dto7d?: number | null;
+    total30d?: number | null; total60dto30d?: number | null; totalAllTime?: number | null;
+  };
+  const data = (await res.json()) as { protocols?: Row[] };
+  const all = data.protocols ?? [];
+  const cur = (r: Row) => (period === '24h' ? r.total24h : period === '7d' ? r.total7d : r.total30d) ?? null;
+  const prev = (r: Row) => (period === '24h' ? r.total48hto24h : period === '7d' ? r.total14dto7d : r.total60dto30d) ?? null;
+  let rows = all.filter((r) => cur(r) != null && (cur(r) as number) > 0);
+  if (category) rows = rows.filter((r) => (r.category ?? '').toLowerCase() === category);
+  if (chain) rows = rows.filter((r) => (r.chains ?? []).some((c) => c.toLowerCase() === chain));
+  const out = rows.map((r) => {
+    const c = cur(r) as number;
+    const p = prev(r);
+    return {
+      protocol: r.slug ?? r.name ?? null,
+      name: r.displayName ?? r.name ?? null,
+      category: r.category ?? null,
+      chains: r.chains ?? [],
+      period_value_usd: Math.round(c),
+      prior_period_usd: p == null ? null : Math.round(p),
+      change_pct: p != null && p > 0 ? Math.round(((c - p) / p) * 1000) / 10 : null,
+      total_24h_usd: r.total24h ?? null,
+      total_7d_usd: r.total7d ?? null,
+      total_30d_usd: r.total30d ?? null,
+      total_all_time_usd: r.totalAllTime != null ? Math.round(r.totalAllTime) : null,
+      _v: c,
+      _p: p,
+    };
+  });
+  let ranked = out;
+  if (sortBy === 'change') {
+    ranked = out.filter((r) => r.change_pct != null && (r._p ?? 0) >= 10000).sort((a, b) => (b.change_pct ?? 0) - (a.change_pct ?? 0));
+  } else {
+    ranked = out.sort((a, b) => b._v - a._v);
+  }
+  if (!ranked.length) {
+    return {
+      found: false,
+      empty_reason: 'no_matching_protocols',
+      hint: 'No protocol matched the category/chain filter with revenue in this window. Category names follow DefiLlama (e.g. "Dexs", "Lending", "Liquid Staking").',
+      data_type: dataType,
+      period,
+    };
+  }
+  return {
+    found: true,
+    data_type: dataType,
+    period,
+    sorted_by: sortBy,
+    matching_protocols: ranked.length,
+    returned: Math.min(limitN, ranked.length),
+    protocols: ranked.slice(0, limitN).map(({ _v, _p, ...rest }) => rest),
+    source: 'DefiLlama, protocol fees and revenue dataset',
+    data_as_of: new Date().toISOString(),
+    note: 'Revenue is the share of fees retained by the protocol or its token holders as DefiLlama defines it; fees are gross user payments. Token supply/emission data: defi_token_unlocks, defi_token_emission.',
   };
 }
 

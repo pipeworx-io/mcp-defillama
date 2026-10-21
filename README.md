@@ -2,7 +2,7 @@
 
 DefiLlama is the canonical free dashboard and API for decentralized finance. TVL (total value locked), protocol tokens, yield aggregators, stablecoins, derivatives, lending markets, DEX volumes — across every major chain and protocol. Used by everyone in crypto. Free, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1745+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1855+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -53,6 +53,10 @@ Free, no auth. DefiLlama is community-supported and welcomes API use; rate limit
 - **Bridge data is approximate.** Cross-chain flows are tracked via bridge contracts; not every bridge is monitored, and centralized bridges (CEX deposits/withdrawals) are invisible.
 - **Token prices vary by source.** DefiLlama has its own price index. May differ slightly from CoinGecko / CoinMarketCap. For high-precision price work, use a dedicated price feed.
 
+## Revenue ranking
+
+`defi_revenue_ranking({ data_type?, period?, sort_by?, category?, chain?, limit? })` ranks protocols by revenue (or fees) over 24h / 7d / 30d, with the prior-period value and percent change. Source: DefiLlama fees and revenue dataset. Pass a returned slug to `defi_protocol_fees` for the daily series.
+
 ## Quick Start
 
 Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
@@ -97,7 +101,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1745+ data sources. The
+Both URLs reach the same gateway and the same 1855+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
