@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-defillama",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "DefiLlama MCP — DeFi analytics from DefiLlama (free, no auth)",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-defillama": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "defillama"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-defillama.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/defillama",
   "pipeworx": {
-    "sourceHash": "v1-e37b1b4a4d40e154ffc65904d1f65c58cce49106c806c90f9f9c298c84de97be",
-    "sourceCommit": "29fb434ca65fe0f61191f19c3502f583f5fb99d7"
+    "mode": "gateway",
+    "slug": "defillama",
+    "gatewaySlug": "defillama",
+    "sourceHash": "v1-f1d9f00af61c229cef25c124ad3b4fe3b6028448d92a8f24d0a5e8acc4763b34",
+    "sourceCommit": "0b3faaa4d85299a961dd86dea75a0f0e1dad280c"
   }
 }
