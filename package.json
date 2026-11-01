@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-defillama",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DefiLlama MCP — DeFi analytics from DefiLlama (free, no auth)",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "defillama",
     "gatewaySlug": "defillama",
-    "sourceHash": "v1-f1d9f00af61c229cef25c124ad3b4fe3b6028448d92a8f24d0a5e8acc4763b34",
-    "sourceCommit": "0b3faaa4d85299a961dd86dea75a0f0e1dad280c"
+    "sourceHash": "v1-d6084facce2ee3957d70eb9c96cc8ff343ba36de86050b6405a03b5586903819",
+    "sourceCommit": "e707a4bb6209f432984c0a83bf64b3138130db89"
   }
 }
